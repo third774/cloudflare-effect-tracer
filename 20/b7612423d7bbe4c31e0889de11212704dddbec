@@ -1,0 +1,21 @@
+LICENSE
+  s_2786f0604c35de::t_9aece8f52acc99 1-21
+package.json
+  s_2786f0604c35de::t_02fa03bba4740f 3-4,9,36,44-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "20b7612423d7bbe4c31e0889de11212704dddbec",
+  "prompts": {},
+  "sessions": {
+    "s_2786f0604c35de": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f07721b63ffex7gzb8nNTzia3P",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Kevin Kipp <kkipp@cloudflare.com>"
+    }
+  }
+}
