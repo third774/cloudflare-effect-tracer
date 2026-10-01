@@ -1,0 +1,47 @@
+{
+  "name": "cloudflare-effect-tracer",
+  "version": "0.1.1",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "checks": "pnpm build && pnpm typecheck && pnpm lint && pnpm format && pnpm test",
+    "lint": "oxlint --type-aware .",
+    "lint:ci": "oxlint --type-aware --quiet .",
+    "lint:fix": "oxlint --type-aware --fix .",
+    "format": "oxfmt --check .",
+    "format:write": "oxfmt --write .",
+    "prepack": "pnpm build",
+    "test": "vitest run",
+    "typecheck": "oxlint --type-aware --type-check .",
+    "typecheck:ci": "oxlint --type-aware --type-check --quiet .",
+    "prepare": "effect-tsgo patch --typescript --oxlint"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20261001.1",
+    "@types/node": "^26.6.3",
+    "effect": "^4.0.0",
+    "oxfmt": "^0.71.0",
+    "oxlint": "1.86.0",
+    "oxlint-tsgolint": "7.0.2003",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "@effect/tsgo": "0.47.1"
+  }
+}
