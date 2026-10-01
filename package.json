@@ -1,6 +1,7 @@
 {
   "name": "cloudflare-effect-tracer",
-  "version": "0.1.1",
+  "version": "0.1.2",
+  "repository": "https://github.com/third774/cloudflare-effect-tracer",
   "type": "module",
   "files": [
     "dist"
