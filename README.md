@@ -54,6 +54,32 @@ leave the status unchanged. The `effect.exit` attribute records `success`, `fail
 Cloudflare spans. Span status is included in OpenTelemetry exports, but the Workers Observability dashboard
 does not yet display it or support filtering by it.
 
+## Span attributes
+
+Use Effect's tracing APIs to add attributes. With the tracer provided as shown above, these attributes are
+forwarded to Cloudflare:
+
+```ts
+import { Effect } from "effect";
+
+const program = Effect.gen(function* () {
+  yield* Effect.annotateCurrentSpan("user.plan", "enterprise");
+  return new Response("ok");
+}).pipe(
+  Effect.withSpan("request", {
+    attributes: { "http.request.method": "GET" },
+  }),
+);
+```
+
+- `Effect.annotateCurrentSpan(key, value)` updates the current Effect span. It also accepts an object with
+  multiple attributes. If no Effect span is active, it does nothing.
+- `Effect.withSpan(name, { attributes: ... })` sets initial attributes on the new span.
+- `Effect.annotateSpans(...)` supplies attributes to spans created within its scope.
+
+The tracer forwards string, number, and boolean values to Cloudflare. Other values remain local to Effect.
+These APIs do not annotate the invocation's root span; use the Workers API below for that.
+
 ## Compatibility
 
 The `setAttributes` and `recordException` span APIs require a Workers compatibility date of `2026-09-25` or
@@ -65,23 +91,24 @@ The tracer checks `spanContext` and `setStatus` at runtime too. If either API is
 or skips status updates, respectively. It does not use `traceFlags` to determine sampling or build downstream
 `traceparent` headers: Cloudflare's flags do not currently reflect sampling.
 
-To add attributes to the active span from a helper, use the Workers tracing API directly. Outside a custom
-span, this annotates the request's root span. Check for `getActiveSpan` first when your Worker may use an
-earlier compatibility date:
+The tracer uses `startActiveSpan` to keep Effect child spans and Worker operations under their correct parent.
+`startSpan` does not make a span active and cannot replace it.
+
+## Root span attributes
+
+To add attributes to the invocation's root span, use the Workers tracing API inside the request handler,
+before entering a custom span. Check for `getActiveSpan` first when your Worker may use an earlier
+compatibility date:
 
 ```ts
 import { tracing } from "cloudflare:workers";
 
-const activeSpan =
-  typeof tracing.getActiveSpan === "function" ? tracing.getActiveSpan() : undefined;
-activeSpan?.setAttribute("user.plan", "enterprise");
+const root = typeof tracing.getActiveSpan === "function" ? tracing.getActiveSpan() : undefined;
+root?.setAttribute("user.plan", "enterprise");
 ```
 
 `getActiveSpan` also requires compatibility date `2026-09-25` or later. If your Worker types do not include it,
 update `@cloudflare/workers-types` to version `5.20260925.1` or later before using this helper.
-
-The tracer uses `startActiveSpan` to keep Effect child spans and Worker operations under their correct parent.
-`startSpan` does not make a span active and cannot replace it.
 
 ## Root span names
 
