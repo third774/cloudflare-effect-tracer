@@ -18,6 +18,8 @@
   },
   "scripts": {
     "build": "tsdown",
+    "changeset": "changeset",
+    "version-packages": "changeset version && pnpm install --lockfile-only",
     "checks": "pnpm build && pnpm typecheck && pnpm lint && pnpm format && pnpm test",
     "lint": "oxlint --type-aware .",
     "lint:ci": "oxlint --type-aware --quiet .",
@@ -31,6 +33,7 @@
     "prepare": "effect-tsgo patch --typescript --oxlint"
   },
   "devDependencies": {
+    "@changesets/cli": "^3.0.3",
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20261001.1",
     "@effect/tsgo": "0.47.1",
@@ -45,5 +48,6 @@
   },
   "peerDependencies": {
     "effect": "^4.0.0"
-  }
+  },
+  "packageManager": "pnpm@12.6.0"
 }

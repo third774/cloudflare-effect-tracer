@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  select-mode:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.select-mode.outputs.mode }}
+      version-changed: ${{ steps.version-changed.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      - id: select-mode
+        uses: changesets/action/select-mode@66d7d1ddafddf1ef45f98ee51a7496f9cdadb2f4 # v2.1.2
+      - id: version-changed
+        if: steps.select-mode.outputs.mode == 'publish' && github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          previous=$(git show "$BEFORE:package.json" | node -p 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).version')
+          current=$(node -p 'require("./package.json").version')
+          if [ "$previous" != "$current" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  version:
+    needs: select-mode
+    if: needs.select-mode.outputs.mode == 'version'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      - uses: changesets/action/version@66d7d1ddafddf1ef45f98ee51a7496f9cdadb2f4 # v2.1.2
+        with:
+          script: pnpm version-packages
+          commit-message: "release: version package"
+          pr-title: "Release package"
+
+  pack:
+    needs: select-mode
+    if: >-
+      needs.select-mode.outputs.mode == 'publish' &&
+      (github.event_name == 'workflow_dispatch' || needs.select-mode.outputs.version-changed == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - name: Pack the built package
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-package"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release-package"
+          mv "$RUNNER_TEMP/release-package/"*.tgz "$RUNNER_TEMP/release-package/package.tgz"
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-package
+          path: ${{ runner.temp }}/release-package/package.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  stage:
+    needs: pack
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install npm with staged publishing support
+        run: npm install --global npm@11.19.1 --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.pack.outputs.artifact-id }}
+          path: ${{ runner.temp }}/release-package
+          merge-multiple: true
+      - name: Stage the package for npm approval
+        run: npm stage publish "$RUNNER_TEMP/release-package/package.tgz" --access public --tag latest --ignore-scripts
