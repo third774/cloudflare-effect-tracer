@@ -2,6 +2,12 @@ import * as cloudflareWorkers from "cloudflare:workers";
 import { Cause, Exit, Option, Predicate, Tracer } from "effect";
 import { AsyncLocalStorage } from "node:async_hooks";
 
+type CloudflareSpanContext = {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly traceFlags: number;
+};
+
 type CloudflareSpan = {
   readonly isTraced: boolean;
   readonly setAttribute: (key: string, value: boolean | number | string) => unknown;
@@ -9,6 +15,11 @@ type CloudflareSpan = {
     attributes: Record<string, boolean | number | string | undefined>,
   ) => unknown;
   readonly recordException?: (exception: Error) => void;
+  readonly spanContext?: () => CloudflareSpanContext;
+  readonly setStatus?: (status: {
+    readonly code: "unset" | "ok" | "error";
+    readonly message?: string;
+  }) => unknown;
   readonly end: () => void;
 };
 
@@ -21,11 +32,13 @@ export type CaptureAsyncContext = () => RunInAsyncContext;
 const startActiveSpan: StartActiveSpan | undefined =
   typeof cloudflareWorkers.tracing?.startActiveSpan === "function"
     ? (name, callback) => cloudflareWorkers.tracing.startActiveSpan(name, callback)
-  : undefined;
+    : undefined;
 // Workers snapshots include the runtime's active tracing span, not only user AsyncLocalStorage values.
 const captureAsyncContext: CaptureAsyncContext = () => AsyncLocalStorage.snapshot();
 
 class CloudflareEffectSpan extends Tracer.NativeSpan {
+  private readonly cloudflareContext: CloudflareSpanContext | undefined;
+
   constructor(
     options: SpanOptions,
     readonly runInAsyncContext: RunInAsyncContext,
@@ -35,6 +48,15 @@ class CloudflareEffectSpan extends Tracer.NativeSpan {
       ...options,
       sampled: options.sampled && (cloudflareSpan?.isTraced ?? false),
     });
+
+    const context =
+      typeof cloudflareSpan?.spanContext === "function" ? cloudflareSpan.spanContext() : undefined;
+    this.cloudflareContext =
+      context !== undefined &&
+      context.traceId !== "00000000000000000000000000000000" &&
+      context.spanId !== "0000000000000000"
+        ? context
+        : undefined;
 
     const parent = Option.getOrUndefined(this.parent);
     const attributes = {
@@ -56,6 +78,14 @@ class CloudflareEffectSpan extends Tracer.NativeSpan {
     }
   }
 
+  override get traceId(): string {
+    return this.cloudflareContext?.traceId ?? super.traceId;
+  }
+
+  override get spanId(): string {
+    return this.cloudflareContext?.spanId ?? super.spanId;
+  }
+
   override end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
     if (this.status._tag === "Ended") {
       return;
@@ -71,6 +101,12 @@ class CloudflareEffectSpan extends Tracer.NativeSpan {
           : "failure",
     );
     if (Exit.isFailure(exit) && this.cloudflareSpan?.isTraced) {
+      if (
+        !Cause.hasInterruptsOnly(exit.cause) &&
+        typeof this.cloudflareSpan.setStatus === "function"
+      ) {
+        this.cloudflareSpan.setStatus({ code: "error" });
+      }
       for (const reason of exit.cause.reasons) {
         const error = Cause.isFailReason(reason)
           ? reason.error
