@@ -602,6 +602,7 @@ describe("Cloudflare Effect tracer", () => {
 
       await Effect.runPromise(program);
 
+      expect(delegate.spans.map((span) => span.name)).toEqual(["span"]);
       expect(observed).toEqual(["span", delegate.spans[0]]);
     });
 
