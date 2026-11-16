@@ -46,6 +46,7 @@ export type CloudflareTracerOptions = {
 };
 
 type SpanState = {
+  // False when this span's Cloudflare span, or the nearest ancestor's, is not traced.
   readonly isTraced: boolean;
   readonly runInAsyncContext: RunInAsyncContext;
 };
@@ -63,10 +64,17 @@ const toCloudflareAttribute = (
   key: string,
   value: unknown,
   serializeAttribute: SerializeAttribute | undefined,
-): CloudflareAttribute | undefined =>
-  Predicate.isString(value) || Predicate.isNumber(value) || Predicate.isBoolean(value)
-    ? value
-    : serializeAttribute?.(value, key);
+): CloudflareAttribute | undefined => {
+  if (Predicate.isString(value) || Predicate.isNumber(value) || Predicate.isBoolean(value)) {
+    return value;
+  }
+  try {
+    return serializeAttribute?.(value, key);
+  } catch {
+    // Effect sets initial attributes before it can end the span, so a throw here would leave spans open.
+    return undefined;
+  }
+};
 
 const setCloudflareAttribute = (
   cloudflareSpan: CloudflareSpan,
@@ -199,11 +207,13 @@ const mirrorDelegateSpan = (
   };
 
   const delegateEnd = span.end.bind(span);
+  let ended = false;
   span.end = (endTime, exit) => {
-    if (span.status._tag === "Ended") {
+    if (ended || span.status._tag === "Ended") {
       return;
     }
 
+    ended = true;
     try {
       delegateEnd(endTime, exit);
     } finally {
@@ -240,27 +250,45 @@ export const makeTracer = (
         : stateFor(Option.getOrUndefined(spanOptions.parent));
       const parentContext = parentState?.runInAsyncContext ?? invocationContext;
 
-      // A delegate keeps its own sampling, so an untraced Cloudflare parent is checked here too.
-      if (!spanOptions.sampled || startSpan === undefined || parentState?.isTraced === false) {
+      // Without a delegate, Effect cascades an untraced span through `sampled`. A delegate keeps its own
+      // sampling, so an untraced Cloudflare ancestor is checked here instead.
+      if (
+        !spanOptions.sampled ||
+        startSpan === undefined ||
+        (delegate !== undefined && parentState?.isTraced === false)
+      ) {
         const span =
           delegate === undefined
             ? new CloudflareEffectSpan(spanOptions, undefined, serializeAttribute)
             : delegate.span(spanOptions);
-        spanStates.set(span, { isTraced: false, runInAsyncContext: parentContext });
+        spanStates.set(span, {
+          isTraced: parentState?.isTraced ?? true,
+          runInAsyncContext: parentContext,
+        });
         return span;
       }
 
       const start = () =>
         startSpan(spanOptions.name, (cloudflareSpan) => {
-          const span =
-            delegate === undefined
-              ? new CloudflareEffectSpan(spanOptions, cloudflareSpan, serializeAttribute)
-              : mirrorDelegateSpan(delegate.span(spanOptions), cloudflareSpan, serializeAttribute);
-          spanStates.set(span, {
-            isTraced: cloudflareSpan.isTraced,
-            runInAsyncContext: captureContext(),
-          });
-          return span;
+          try {
+            const span =
+              delegate === undefined
+                ? new CloudflareEffectSpan(spanOptions, cloudflareSpan, serializeAttribute)
+                : mirrorDelegateSpan(
+                    delegate.span(spanOptions),
+                    cloudflareSpan,
+                    serializeAttribute,
+                  );
+            spanStates.set(span, {
+              isTraced: cloudflareSpan.isTraced,
+              runInAsyncContext: captureContext(),
+            });
+            return span;
+          } catch (error) {
+            // startActiveSpan does not end the span when its callback throws.
+            cloudflareSpan.end();
+            throw error;
+          }
         });
       return parentState === activeState ? start() : parentContext(start);
     },

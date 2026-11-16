@@ -334,6 +334,19 @@ describe("Cloudflare Effect tracer", () => {
     ]);
   });
 
+  it("creates Cloudflare spans for children that override an unsampled parent", async () => {
+    const recorder = makeRecorder();
+    const program = Effect.void.pipe(
+      Effect.withSpan("child", { sampled: true }),
+      Effect.withSpan("parent", { sampled: false }),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    await Effect.runPromise(program);
+
+    expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["child", true]]);
+  });
+
   it("cascades an unsampled Cloudflare decision to descendants", async () => {
     const recorder = makeRecorder((name) => name !== "parent");
     const program = Effect.succeed("value").pipe(
@@ -531,6 +544,21 @@ describe("Cloudflare Effect tracer", () => {
     expect(attributes?.has("null")).toBe(false);
   });
 
+  it("skips attributes whose serializer throws and still ends the span", async () => {
+    const recorder = makeRecorder(() => true, true, true, {
+      tracerOptions: { serializeAttribute: (value) => JSON.stringify(value) },
+    });
+    const program = Effect.void.pipe(
+      Effect.withSpan("attributes", { attributes: { bigint: 1n } }),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    await Effect.runPromise(program);
+
+    expect(recorder.spans[0]?.attributes.has("bigint")).toBe(false);
+    expect(recorder.spans[0]?.ended).toBe(true);
+  });
+
   it("forwards serialized attributes and keeps the original values in Effect", async () => {
     const recorder = makeRecorder(() => true, true, true, {
       tracerOptions: {
@@ -659,10 +687,26 @@ describe("Cloudflare Effect tracer", () => {
       const span = recorder.tracer.span(spanOptions("failure", Option.none(), true));
 
       expect(() => span.end(1n, Exit.fail(failure))).toThrow(endError);
+      expect(() => span.end(2n, Exit.fail(failure))).not.toThrow();
       expect(recorder.spans[0]?.attributes.get("effect.exit")).toBe("failure");
       expect(recorder.spans[0]?.statuses).toEqual([{ code: "error" }]);
       expect(recorder.spans[0]?.exceptions).toEqual([failure]);
       expect(recorder.spans[0]?.ended).toBe(true);
+    });
+
+    it("ends the Cloudflare span when the delegate fails to create a span", () => {
+      const spanError = new Error("span failed");
+      const delegate = Tracer.make({
+        span: () => {
+          throw spanError;
+        },
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+
+      expect(() => recorder.tracer.span(spanOptions("failure", Option.none(), true))).toThrow(
+        spanError,
+      );
+      expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["failure", true]]);
     });
   });
 });
