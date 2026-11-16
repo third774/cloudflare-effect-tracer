@@ -23,11 +23,32 @@ type CloudflareSpan = {
   readonly end: () => void;
 };
 
+type CloudflareAttribute = boolean | number | string;
+
 type SpanOptions = Parameters<Tracer.Tracer["span"]>[0];
 
 export type StartActiveSpan = <A>(name: string, callback: (span: CloudflareSpan) => A) => A;
 export type RunInAsyncContext = <A>(callback: () => A) => A;
 export type CaptureAsyncContext = () => RunInAsyncContext;
+export type SerializeAttribute = (value: unknown, key: string) => CloudflareAttribute | undefined;
+
+export type CloudflareTracerOptions = {
+  /**
+   * A tracer that owns the Effect spans, such as `SentryEffectTracer` from `@sentry/effect`.
+   * Its spans keep their IDs and sampling decisions, and Cloudflare spans mirror them.
+   */
+  readonly delegate?: Tracer.Tracer | undefined;
+  /**
+   * Converts an attribute value that is not a string, number, or boolean into a value that Cloudflare accepts.
+   * Return `undefined` to leave the attribute off the Cloudflare span.
+   */
+  readonly serializeAttribute?: SerializeAttribute | undefined;
+};
+
+type SpanState = {
+  readonly isTraced: boolean;
+  readonly runInAsyncContext: RunInAsyncContext;
+};
 
 const startActiveSpan: StartActiveSpan | undefined =
   typeof cloudflareWorkers.tracing?.startActiveSpan === "function"
@@ -36,13 +57,84 @@ const startActiveSpan: StartActiveSpan | undefined =
 // Workers snapshots include the runtime's active tracing span, not only user AsyncLocalStorage values.
 const captureAsyncContext: CaptureAsyncContext = () => AsyncLocalStorage.snapshot();
 
+const toCloudflareAttribute = (
+  key: string,
+  value: unknown,
+  serializeAttribute: SerializeAttribute | undefined,
+): CloudflareAttribute | undefined =>
+  Predicate.isString(value) || Predicate.isNumber(value) || Predicate.isBoolean(value)
+    ? value
+    : serializeAttribute?.(value, key);
+
+const setCloudflareAttribute = (
+  cloudflareSpan: CloudflareSpan,
+  key: string,
+  value: unknown,
+  serializeAttribute: SerializeAttribute | undefined,
+): void => {
+  const attribute = toCloudflareAttribute(key, value, serializeAttribute);
+  if (attribute !== undefined) cloudflareSpan.setAttribute(key, attribute);
+};
+
+const effectAttributes = (span: Tracer.Span) => ({
+  "scope.name": "effect",
+  "effect.trace.id": span.traceId,
+  "effect.span.id": span.spanId,
+  "effect.span.kind": span.kind,
+  "effect.parent.span.id": Option.getOrUndefined(span.parent)?.spanId,
+});
+
+const setInitialAttributes = (
+  cloudflareSpan: CloudflareSpan,
+  attributes: Record<string, CloudflareAttribute | undefined>,
+): void => {
+  if (typeof cloudflareSpan.setAttributes === "function") {
+    cloudflareSpan.setAttributes(attributes);
+  } else {
+    for (const [key, value] of Object.entries(attributes)) {
+      if (value !== undefined) cloudflareSpan.setAttribute(key, value);
+    }
+  }
+};
+
+// Always ends the Cloudflare span, even when recording the outcome throws.
+const endCloudflareSpan = (cloudflareSpan: CloudflareSpan, exit: Exit.Exit<unknown, unknown>) => {
+  try {
+    cloudflareSpan.setAttribute(
+      "effect.exit",
+      Exit.isSuccess(exit)
+        ? "success"
+        : Cause.hasInterruptsOnly(exit.cause)
+          ? "interrupted"
+          : "failure",
+    );
+    if (Exit.isFailure(exit) && cloudflareSpan.isTraced) {
+      if (!Cause.hasInterruptsOnly(exit.cause) && typeof cloudflareSpan.setStatus === "function") {
+        cloudflareSpan.setStatus({ code: "error" });
+      }
+      for (const reason of exit.cause.reasons) {
+        const error = Cause.isFailReason(reason)
+          ? reason.error
+          : Cause.isDieReason(reason)
+            ? reason.defect
+            : undefined;
+        if (error instanceof Error && typeof cloudflareSpan.recordException === "function") {
+          cloudflareSpan.recordException(error);
+        }
+      }
+    }
+  } finally {
+    cloudflareSpan.end();
+  }
+};
+
 class CloudflareEffectSpan extends Tracer.NativeSpan {
   private readonly cloudflareContext: CloudflareSpanContext | undefined;
 
   constructor(
     options: SpanOptions,
-    readonly runInAsyncContext: RunInAsyncContext,
     readonly cloudflareSpan?: CloudflareSpan,
+    private readonly serializeAttribute?: SerializeAttribute,
   ) {
     super({
       ...options,
@@ -58,24 +150,11 @@ class CloudflareEffectSpan extends Tracer.NativeSpan {
         ? context
         : undefined;
 
-    const parent = Option.getOrUndefined(this.parent);
-    const attributes = {
-      "scope.name": "effect",
-      "effect.trace.id": this.traceId,
-      "effect.span.id": this.spanId,
-      "effect.span.kind": this.kind,
-      "effect.parent.span.id": parent?.spanId,
-    };
+    const attributes = effectAttributes(this);
     for (const [key, value] of Object.entries(attributes)) {
       if (value !== undefined) super.attribute(key, value);
     }
-    if (typeof this.cloudflareSpan?.setAttributes === "function") {
-      this.cloudflareSpan.setAttributes(attributes);
-    } else {
-      for (const [key, value] of Object.entries(attributes)) {
-        if (value !== undefined) this.cloudflareSpan?.setAttribute(key, value);
-      }
-    }
+    if (this.cloudflareSpan !== undefined) setInitialAttributes(this.cloudflareSpan, attributes);
   }
 
   override get traceId(): string {
@@ -92,57 +171,61 @@ class CloudflareEffectSpan extends Tracer.NativeSpan {
     }
 
     super.end(endTime, exit);
-    this.cloudflareSpan?.setAttribute(
-      "effect.exit",
-      Exit.isSuccess(exit)
-        ? "success"
-        : Cause.hasInterruptsOnly(exit.cause)
-          ? "interrupted"
-          : "failure",
-    );
-    if (Exit.isFailure(exit) && this.cloudflareSpan?.isTraced) {
-      if (
-        !Cause.hasInterruptsOnly(exit.cause) &&
-        typeof this.cloudflareSpan.setStatus === "function"
-      ) {
-        this.cloudflareSpan.setStatus({ code: "error" });
-      }
-      for (const reason of exit.cause.reasons) {
-        const error = Cause.isFailReason(reason)
-          ? reason.error
-          : Cause.isDieReason(reason)
-            ? reason.defect
-            : undefined;
-        if (error instanceof Error) {
-          if (typeof this.cloudflareSpan.recordException === "function") {
-            this.cloudflareSpan.recordException(error);
-          }
-        }
-      }
-    }
-    this.cloudflareSpan?.end();
+    if (this.cloudflareSpan !== undefined) endCloudflareSpan(this.cloudflareSpan, exit);
   }
 
   override attribute(key: string, value: unknown): void {
     super.attribute(key, value);
-    if (Predicate.isString(value) || Predicate.isNumber(value) || Predicate.isBoolean(value)) {
-      this.cloudflareSpan?.setAttribute(key, value);
+    if (this.cloudflareSpan !== undefined) {
+      setCloudflareAttribute(this.cloudflareSpan, key, value, this.serializeAttribute);
     }
   }
 }
 
+// Returns the delegate's span itself, because the delegate may identify its own spans when they become parents.
+const mirrorDelegateSpan = (
+  span: Tracer.Span,
+  cloudflareSpan: CloudflareSpan,
+  serializeAttribute: SerializeAttribute | undefined,
+): Tracer.Span => {
+  setInitialAttributes(cloudflareSpan, effectAttributes(span));
+
+  const delegateAttribute = span.attribute.bind(span);
+  span.attribute = (key, value) => {
+    delegateAttribute(key, value);
+    setCloudflareAttribute(cloudflareSpan, key, value, serializeAttribute);
+  };
+
+  const delegateEnd = span.end.bind(span);
+  span.end = (endTime, exit) => {
+    if (span.status._tag === "Ended") {
+      return;
+    }
+
+    try {
+      delegateEnd(endTime, exit);
+    } finally {
+      endCloudflareSpan(cloudflareSpan, exit);
+    }
+  };
+
+  return span;
+};
+
 export const makeTracer = (
   startSpan: StartActiveSpan | undefined,
   captureContext: CaptureAsyncContext = captureAsyncContext,
+  options: CloudflareTracerOptions = {},
 ): Tracer.Tracer => {
+  const { delegate, serializeAttribute } = options;
   const invocationContext = captureContext();
-  let activeSpan: CloudflareEffectSpan | undefined;
-  const cloudflareSpanFor = (
-    span: Tracer.AnySpan | undefined,
-  ): CloudflareEffectSpan | undefined => {
+  const spanStates = new WeakMap<Tracer.Span, SpanState>();
+  let activeState: SpanState | undefined;
+  const stateFor = (span: Tracer.AnySpan | undefined): SpanState | undefined => {
     while (span?._tag === "Span") {
-      if (span instanceof CloudflareEffectSpan) {
-        return span;
+      const state = spanStates.get(span);
+      if (state !== undefined) {
+        return state;
       }
       span = Option.getOrUndefined(span.parent);
     }
@@ -150,41 +233,58 @@ export const makeTracer = (
   };
 
   return Tracer.make({
-    span(options) {
-      const parentSpan = options.root
+    span(spanOptions) {
+      const parentState = spanOptions.root
         ? undefined
-        : cloudflareSpanFor(Option.getOrUndefined(options.parent));
-      const parentContext = parentSpan?.runInAsyncContext ?? invocationContext;
+        : stateFor(Option.getOrUndefined(spanOptions.parent));
+      const parentContext = parentState?.runInAsyncContext ?? invocationContext;
 
-      if (!options.sampled || startSpan === undefined) {
-        return new CloudflareEffectSpan(options, parentContext);
+      // A delegate keeps its own sampling, so an untraced Cloudflare parent is checked here too.
+      if (!spanOptions.sampled || startSpan === undefined || parentState?.isTraced === false) {
+        const span =
+          delegate === undefined
+            ? new CloudflareEffectSpan(spanOptions, undefined, serializeAttribute)
+            : delegate.span(spanOptions);
+        spanStates.set(span, { isTraced: false, runInAsyncContext: parentContext });
+        return span;
       }
 
       const start = () =>
-        startSpan(
-          options.name,
-          (span) => new CloudflareEffectSpan(options, captureContext(), span),
-        );
-      return parentSpan === activeSpan ? start() : parentContext(start);
+        startSpan(spanOptions.name, (cloudflareSpan) => {
+          const span =
+            delegate === undefined
+              ? new CloudflareEffectSpan(spanOptions, cloudflareSpan, serializeAttribute)
+              : mirrorDelegateSpan(delegate.span(spanOptions), cloudflareSpan, serializeAttribute);
+          spanStates.set(span, {
+            isTraced: cloudflareSpan.isTraced,
+            runInAsyncContext: captureContext(),
+          });
+          return span;
+        });
+      return parentState === activeState ? start() : parentContext(start);
     },
     context(primitive, fiber) {
-      const span = cloudflareSpanFor(fiber.cache.span);
-      const evaluate = () => primitive["~effect/Effect/evaluate"](fiber);
-      if (span !== undefined && span === activeSpan) {
+      const state = stateFor(fiber.cache.span);
+      const evaluate = () =>
+        delegate?.context === undefined
+          ? primitive["~effect/Effect/evaluate"](fiber)
+          : delegate.context(primitive, fiber);
+      if (state !== undefined && state === activeState) {
         return evaluate();
       }
-      const runInAsyncContext = span?.runInAsyncContext ?? invocationContext;
+      const runInAsyncContext = state?.runInAsyncContext ?? invocationContext;
       return runInAsyncContext(() => {
-        const previousSpan = activeSpan;
-        activeSpan = span;
+        const previousState = activeState;
+        activeState = state;
         try {
           return evaluate();
         } finally {
-          activeSpan = previousSpan;
+          activeState = previousState;
         }
       });
     },
   });
 };
 
-export const makeCloudflareTracer = (): Tracer.Tracer => makeTracer(startActiveSpan);
+export const makeCloudflareTracer = (options?: CloudflareTracerOptions): Tracer.Tracer =>
+  makeTracer(startActiveSpan, captureAsyncContext, options);

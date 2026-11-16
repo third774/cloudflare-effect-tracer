@@ -77,8 +77,44 @@ const program = Effect.gen(function* () {
 - `Effect.withSpan(name, { attributes: ... })` sets initial attributes on the new span.
 - `Effect.annotateSpans(...)` supplies attributes to spans created within its scope.
 
-The tracer forwards string, number, and boolean values to Cloudflare. Other values remain local to Effect.
-These APIs do not annotate the invocation's root span; use the Workers API below for that.
+The tracer forwards string, number, and boolean values to Cloudflare. Other values remain local to Effect,
+unless you pass `serializeAttribute` to convert them:
+
+```ts
+makeCloudflareTracer({
+  serializeAttribute: (value) => JSON.stringify(value),
+});
+```
+
+Return `undefined` from `serializeAttribute` to leave an attribute off the Cloudflare span. Effect still keeps the
+original value. These APIs do not annotate the invocation's root span; use the Workers API below for that.
+
+## Use with another tracer
+
+Effect uses one tracer at a time. To send Effect spans to another tracer as well as to Cloudflare, pass that
+tracer as `delegate`. For example, with Sentry:
+
+```ts
+import { SentryEffectTracer } from "@sentry/effect";
+import { makeCloudflareTracer } from "cloudflare-effect-tracer";
+import { Effect, Tracer } from "effect";
+
+program.pipe(
+  Effect.provideService(Tracer.Tracer, makeCloudflareTracer({ delegate: SentryEffectTracer })),
+);
+```
+
+With a delegate:
+
+- The delegate creates and owns each Effect span. `Effect.currentSpan` returns the delegate's span, with its
+  trace and span IDs. The `effect.*` ID attributes on the Cloudflare span hold the delegate's IDs, so you can
+  look up the same span in both systems.
+- Each Effect span still gets a Cloudflare span with the same nesting, attributes, exit, status, and exceptions.
+- The delegate keeps its own sampling decision. When Cloudflare reports that a span is not traced, its
+  descendants get no Cloudflare spans, but the delegate still receives them.
+- The delegate's `context` hook, if it has one, runs inside the restored Cloudflare context. Delegates that
+  restore their own active span when a fiber resumes, such as Sentry, keep doing so.
+- If the delegate throws while ending a span, the Cloudflare span still ends.
 
 ## Compatibility
 
