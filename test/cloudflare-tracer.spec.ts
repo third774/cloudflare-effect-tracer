@@ -131,6 +131,7 @@ const makeRecorder = (
       return activeSpan;
     },
     tracer: makeTracer(startActiveSpan, captureAsyncContext, options.tracerOptions),
+    makeTracer: () => makeTracer(startActiveSpan, captureAsyncContext, options.tracerOptions),
   };
 };
 
@@ -309,6 +310,28 @@ describe("Cloudflare Effect tracer", () => {
     recorder.tracer.span(spanOptions("child", Option.some(externalParent), false));
 
     expect(recorder.spans[0]?.parent).toBe(recorder.invocation);
+  });
+
+  it("keeps a parent's context when another tracer creates the child", async () => {
+    const recorder = makeRecorder();
+    const innerTracer = recorder.makeTracer();
+    const program = Effect.yieldNow.pipe(
+      Effect.andThen(
+        Effect.void.pipe(
+          Effect.withSpan("child"),
+          Effect.provideService(Tracer.Tracer, innerTracer),
+        ),
+      ),
+      Effect.withSpan("parent"),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    await Effect.runPromise(program);
+
+    expect(recorder.spans.map((span) => [span.name, span.parent?.name])).toEqual([
+      ["parent", "invocation"],
+      ["child", "parent"],
+    ]);
   });
 
   it("cascades an unsampled Cloudflare decision to descendants", async () => {

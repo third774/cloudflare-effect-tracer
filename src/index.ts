@@ -56,6 +56,8 @@ const startActiveSpan: StartActiveSpan | undefined =
     : undefined;
 // Workers snapshots include the runtime's active tracing span, not only user AsyncLocalStorage values.
 const captureAsyncContext: CaptureAsyncContext = () => AsyncLocalStorage.snapshot();
+// Shared by all tracers, so a span keeps its Cloudflare context when a different tracer creates its children.
+const spanStates = new WeakMap<Tracer.Span, SpanState>();
 
 const toCloudflareAttribute = (
   key: string,
@@ -219,7 +221,6 @@ export const makeTracer = (
 ): Tracer.Tracer => {
   const { delegate, serializeAttribute } = options;
   const invocationContext = captureContext();
-  const spanStates = new WeakMap<Tracer.Span, SpanState>();
   let activeState: SpanState | undefined;
   const stateFor = (span: Tracer.AnySpan | undefined): SpanState | undefined => {
     while (span?._tag === "Span") {
