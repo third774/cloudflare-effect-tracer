@@ -82,12 +82,14 @@ unless you pass `serializeAttribute` to convert them:
 
 ```ts
 makeCloudflareTracer({
-  serializeAttribute: (value) => JSON.stringify(value),
+  serializeAttribute: (value: unknown, key: string) =>
+    key.startsWith("app.") ? JSON.stringify(value) : undefined,
 });
 ```
 
-Return `undefined` from `serializeAttribute`, or throw, to leave an attribute off the Cloudflare span. Effect still keeps the
-original value. These APIs do not annotate the invocation's root span; use the Workers API below for that.
+`serializeAttribute` receives the attribute value and its key, and returns a string, number, boolean, or
+`undefined`. Return `undefined`, or throw, to leave the attribute off the Cloudflare span. Effect still keeps
+the original value. These APIs do not annotate the invocation's root span; use the Workers API below for that.
 
 ## Use with another tracer
 
@@ -117,6 +119,8 @@ With a delegate:
 - The delegate's `context` hook, if it has one, runs inside the restored Cloudflare context. Delegates that
   restore their own active span when a fiber resumes, such as Sentry, keep doing so.
 - If the delegate throws while ending a span, the Cloudflare span still ends.
+- The delegate must return a new, open span for each call. A span that it returns again, or that is already
+  ended, gets no Cloudflare span.
 
 ## Compatibility
 

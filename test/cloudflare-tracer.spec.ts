@@ -694,7 +694,7 @@ describe("Cloudflare Effect tracer", () => {
       expect(recorder.spans[0]?.ended).toBe(true);
     });
 
-    it("ends the Cloudflare span when the delegate fails to create a span", () => {
+    it("starts no Cloudflare span when the delegate fails to create a span", () => {
       const spanError = new Error("span failed");
       const delegate = Tracer.make({
         span: () => {
@@ -706,7 +706,67 @@ describe("Cloudflare Effect tracer", () => {
       expect(() => recorder.tracer.span(spanOptions("failure", Option.none(), true))).toThrow(
         spanError,
       );
+      expect(recorder.spans).toEqual([]);
+    });
+
+    it("ends the Cloudflare span when mirroring the delegate span fails", () => {
+      const mirrorError = new Error("mirror failed");
+      const delegate = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          Object.defineProperty(span, "traceId", {
+            get: () => {
+              throw mirrorError;
+            },
+          });
+          return span;
+        },
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+
+      expect(() => recorder.tracer.span(spanOptions("failure", Option.none(), true))).toThrow(
+        mirrorError,
+      );
       expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["failure", true]]);
+    });
+
+    it("starts no Cloudflare span for a delegate span that is already ended", async () => {
+      const delegate = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          span.end(options.startTime, Exit.void);
+          return span;
+        },
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const program = Effect.succeed("value").pipe(
+        Effect.withSpan("child"),
+        Effect.withSpan("ended"),
+        Effect.provideService(Tracer.Tracer, recorder.tracer),
+      );
+
+      await expect(Effect.runPromise(program)).resolves.toBe("value");
+
+      expect(recorder.spans).toEqual([]);
+      expect(recorder.activeSpan).toBe(recorder.invocation);
+    });
+
+    it("mirrors a reused delegate span only once", async () => {
+      let reused: Tracer.NativeSpan | undefined;
+      const delegate = Tracer.make({
+        span: (options) => (reused ??= new Tracer.NativeSpan(options)),
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const program = Effect.annotateCurrentSpan("app.id", "id").pipe(
+        Effect.withSpan("inner"),
+        Effect.withSpan("outer"),
+        Effect.provideService(Tracer.Tracer, recorder.tracer),
+      );
+
+      await Effect.runPromise(program);
+
+      expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["outer", true]]);
+      expect(recorder.spans[0]?.attributes.get("app.id")).toBe("id");
     });
   });
 });

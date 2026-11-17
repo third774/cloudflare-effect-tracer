@@ -249,6 +249,16 @@ export const makeTracer = (
         ? undefined
         : stateFor(Option.getOrUndefined(spanOptions.parent));
       const parentContext = parentState?.runInAsyncContext ?? invocationContext;
+      const withoutCloudflareSpan = (span: Tracer.Span): Tracer.Span => {
+        // A reused delegate span keeps the state from its first use.
+        if (!spanStates.has(span)) {
+          spanStates.set(span, {
+            isTraced: parentState?.isTraced ?? true,
+            runInAsyncContext: parentContext,
+          });
+        }
+        return span;
+      };
 
       // Without a delegate, Effect cascades an untraced span through `sampled`. A delegate keeps its own
       // sampling, so an untraced Cloudflare ancestor is checked here instead.
@@ -257,28 +267,30 @@ export const makeTracer = (
         startSpan === undefined ||
         (delegate !== undefined && parentState?.isTraced === false)
       ) {
-        const span =
+        return withoutCloudflareSpan(
           delegate === undefined
             ? new CloudflareEffectSpan(spanOptions, undefined, serializeAttribute)
-            : delegate.span(spanOptions);
-        spanStates.set(span, {
-          isTraced: parentState?.isTraced ?? true,
-          runInAsyncContext: parentContext,
-        });
-        return span;
+            : delegate.span(spanOptions),
+        );
       }
 
-      const start = () =>
-        startSpan(spanOptions.name, (cloudflareSpan) => {
+      const start = () => {
+        const delegateSpan = delegate?.span(spanOptions);
+        // Mirror only a new, open delegate span. A reused span already has a Cloudflare span, and Effect
+        // may never end a span that is already ended.
+        if (
+          delegateSpan !== undefined &&
+          (spanStates.has(delegateSpan) || delegateSpan.status._tag === "Ended")
+        ) {
+          return withoutCloudflareSpan(delegateSpan);
+        }
+
+        return startSpan(spanOptions.name, (cloudflareSpan) => {
           try {
             const span =
-              delegate === undefined
+              delegateSpan === undefined
                 ? new CloudflareEffectSpan(spanOptions, cloudflareSpan, serializeAttribute)
-                : mirrorDelegateSpan(
-                    delegate.span(spanOptions),
-                    cloudflareSpan,
-                    serializeAttribute,
-                  );
+                : mirrorDelegateSpan(delegateSpan, cloudflareSpan, serializeAttribute);
             spanStates.set(span, {
               isTraced: cloudflareSpan.isTraced,
               runInAsyncContext: captureContext(),
@@ -290,6 +302,7 @@ export const makeTracer = (
             throw error;
           }
         });
+      };
       return parentState === activeState ? start() : parentContext(start);
     },
     context(primitive, fiber) {
