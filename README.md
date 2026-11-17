@@ -77,8 +77,50 @@ const program = Effect.gen(function* () {
 - `Effect.withSpan(name, { attributes: ... })` sets initial attributes on the new span.
 - `Effect.annotateSpans(...)` supplies attributes to spans created within its scope.
 
-The tracer forwards string, number, and boolean values to Cloudflare. Other values remain local to Effect.
-These APIs do not annotate the invocation's root span; use the Workers API below for that.
+The tracer forwards string, number, and boolean values to Cloudflare. Other values remain local to Effect,
+unless you pass `serializeAttribute` to convert them:
+
+```ts
+makeCloudflareTracer({
+  serializeAttribute: (value: unknown, key: string) =>
+    key.startsWith("app.") ? JSON.stringify(value) : undefined,
+});
+```
+
+`serializeAttribute` receives the attribute value and its key, and returns a string, number, boolean, or
+`undefined`. Return `undefined`, or throw, to leave the attribute off the Cloudflare span. Effect still keeps
+the original value. These APIs do not annotate the invocation's root span; use the Workers API below for that.
+
+## Use with another tracer
+
+Effect uses one tracer at a time. To send Effect spans to another tracer as well as to Cloudflare, pass that
+tracer as `delegate`. For example, with Sentry:
+
+```ts
+import { SentryEffectTracer } from "@sentry/effect";
+import { makeCloudflareTracer } from "cloudflare-effect-tracer";
+import { Effect, Tracer } from "effect";
+
+program.pipe(
+  Effect.provideService(Tracer.Tracer, makeCloudflareTracer({ delegate: SentryEffectTracer })),
+);
+```
+
+With a delegate:
+
+- The delegate creates and owns each Effect span. `Effect.currentSpan` returns the delegate's span, with its
+  trace and span IDs. The `effect.*` ID attributes on the Cloudflare span hold the delegate's IDs, so you can
+  look up the same span in both systems.
+- Each sampled Effect span still gets a Cloudflare span with the same nesting, attributes, exit, status, and
+  exceptions.
+- The delegate keeps its own sampling decision. Effect passes the delegate span's `sampled` value to its
+  children, so spans below a span the delegate does not sample get no Cloudflare spans. When Cloudflare reports
+  that a span is not traced, its descendants get no Cloudflare spans, but the delegate still receives them.
+- The delegate's `context` hook, if it has one, runs inside the restored Cloudflare context. Delegates that
+  restore their own active span when a fiber resumes, such as Sentry, keep doing so.
+- If the delegate throws while ending a span, the Cloudflare span still ends.
+- The delegate must return a new span for each call. A span that is already ended gets no Cloudflare span.
+  Returning a span again throws an error to prevent use of the first span's async context.
 
 ## Compatibility
 

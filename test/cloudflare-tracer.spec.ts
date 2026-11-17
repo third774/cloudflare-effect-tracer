@@ -1,7 +1,9 @@
 import { Context, Data, Effect, Exit, Fiber, Option, Tracer } from "effect";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { describe, expect, it } from "vitest";
 import {
   type CaptureAsyncContext,
+  type CloudflareTracerOptions,
   makeTracer,
   type RunInAsyncContext,
   type StartActiveSpan,
@@ -31,6 +33,8 @@ const makeRecorder = (
     readonly supportsSpanContext?: boolean;
     readonly supportsStatus?: boolean;
     readonly spanContext?: (index: number) => SpanContext;
+    readonly statusError?: Error;
+    readonly tracerOptions?: CloudflareTracerOptions;
   } = {},
 ) => {
   const invocation: RecordedSpan = {
@@ -95,6 +99,7 @@ const makeRecorder = (
           : {
               setStatus: (status: SpanStatus) => {
                 expect(recorded.ended).toBe(false);
+                if (options.statusError !== undefined) throw options.statusError;
                 recorded.statuses.push(status);
               },
             }),
@@ -120,7 +125,50 @@ const makeRecorder = (
     return runInAsyncContext;
   };
 
-  return { invocation, spans, tracer: makeTracer(startActiveSpan, captureAsyncContext) };
+  return {
+    invocation,
+    spans,
+    get activeSpan() {
+      return activeSpan;
+    },
+    tracer: makeTracer(startActiveSpan, captureAsyncContext, options.tracerOptions),
+    makeTracer: () => makeTracer(startActiveSpan, captureAsyncContext, options.tracerOptions),
+  };
+};
+
+const makeDelegate = (options: { readonly endError?: Error } = {}) => {
+  const spans: Tracer.NativeSpan[] = [];
+  let activeSpan: Tracer.AnySpan | undefined;
+  const tracer = Tracer.make({
+    span: (spanOptions) => {
+      const span = new Tracer.NativeSpan(spanOptions);
+      if (options.endError !== undefined) {
+        const endError = options.endError;
+        span.end = () => {
+          throw endError;
+        };
+      }
+      spans.push(span);
+      return span;
+    },
+    context: (primitive, fiber) => {
+      const previousSpan = activeSpan;
+      activeSpan = fiber.cache.span;
+      try {
+        return primitive["~effect/Effect/evaluate"](fiber);
+      } finally {
+        activeSpan = previousSpan;
+      }
+    },
+  });
+
+  return {
+    spans,
+    tracer,
+    get activeSpan() {
+      return activeSpan;
+    },
+  };
 };
 
 const spanOptions = (
@@ -263,6 +311,41 @@ describe("Cloudflare Effect tracer", () => {
     recorder.tracer.span(spanOptions("child", Option.some(externalParent), false));
 
     expect(recorder.spans[0]?.parent).toBe(recorder.invocation);
+  });
+
+  it("keeps a parent's context when another tracer creates the child", async () => {
+    const recorder = makeRecorder();
+    const innerTracer = recorder.makeTracer();
+    const program = Effect.yieldNow.pipe(
+      Effect.andThen(
+        Effect.void.pipe(
+          Effect.withSpan("child"),
+          Effect.provideService(Tracer.Tracer, innerTracer),
+        ),
+      ),
+      Effect.withSpan("parent"),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    await Effect.runPromise(program);
+
+    expect(recorder.spans.map((span) => [span.name, span.parent?.name])).toEqual([
+      ["parent", "invocation"],
+      ["child", "parent"],
+    ]);
+  });
+
+  it("creates Cloudflare spans for children that override an unsampled parent", async () => {
+    const recorder = makeRecorder();
+    const program = Effect.void.pipe(
+      Effect.withSpan("child", { sampled: true }),
+      Effect.withSpan("parent", { sampled: false }),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    await Effect.runPromise(program);
+
+    expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["child", true]]);
   });
 
   it("cascades an unsampled Cloudflare decision to descendants", async () => {
@@ -460,5 +543,274 @@ describe("Cloudflare Effect tracer", () => {
     expect(attributes?.has("bigint")).toBe(false);
     expect(attributes?.has("object")).toBe(false);
     expect(attributes?.has("null")).toBe(false);
+  });
+
+  it("skips attributes whose serializer throws and still ends the span", async () => {
+    const recorder = makeRecorder(() => true, true, true, {
+      tracerOptions: { serializeAttribute: (value) => JSON.stringify(value) },
+    });
+    const program = Effect.void.pipe(
+      Effect.withSpan("attributes", { attributes: { bigint: 1n } }),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    await Effect.runPromise(program);
+
+    expect(recorder.spans[0]?.attributes.has("bigint")).toBe(false);
+    expect(recorder.spans[0]?.ended).toBe(true);
+  });
+
+  it("forwards serialized attributes and keeps the original values in Effect", async () => {
+    const recorder = makeRecorder(() => true, true, true, {
+      tracerOptions: {
+        serializeAttribute: (value, key) => (key === "object" ? JSON.stringify(value) : undefined),
+      },
+    });
+    const program = Effect.currentSpan.pipe(
+      Effect.withSpan("attributes", { attributes: { object: { value: true }, null: null } }),
+      Effect.provideService(Tracer.Tracer, recorder.tracer),
+    );
+
+    const span = await Effect.runPromise(program);
+
+    expect(recorder.spans[0]?.attributes.get("object")).toBe('{"value":true}');
+    expect(recorder.spans[0]?.attributes.has("null")).toBe(false);
+    expect(span instanceof Tracer.NativeSpan && span.attributes.get("object")).toEqual({
+      value: true,
+    });
+  });
+
+  it("ends the Cloudflare span when recording the outcome throws", () => {
+    const statusError = new Error("status failed");
+    const recorder = makeRecorder(() => true, true, true, { statusError });
+    const span = recorder.tracer.span(spanOptions("failure", Option.none(), true));
+
+    expect(() => span.end(1n, Exit.fail("secret"))).toThrow(statusError);
+    expect(recorder.spans[0]?.ended).toBe(true);
+  });
+
+  describe("with a delegate", () => {
+    it("mirrors delegate spans across suspended and forked fibers", async () => {
+      const delegate = makeDelegate();
+      const recorder = makeRecorder(() => true, true, true, {
+        tracerOptions: { delegate: delegate.tracer },
+      });
+      let currentSpan: Tracer.AnySpan | undefined;
+      const child = Effect.fn("child")(function* () {
+        yield* Effect.yieldNow;
+        currentSpan = yield* Effect.currentSpan;
+        return "value";
+      });
+      const parent = Effect.fn("parent")(function* () {
+        yield* Effect.yieldNow;
+        const childFiber = yield* Effect.forkChild(child());
+        return yield* Fiber.join(childFiber);
+      });
+
+      await expect(
+        Effect.runPromise(
+          parent().pipe(
+            Effect.withSpan("outer", { attributes: { "app.id": "id" } }),
+            Effect.provideService(Tracer.Tracer, recorder.tracer),
+          ),
+        ),
+      ).resolves.toBe("value");
+
+      expect(recorder.spans.map((span) => [span.name, span.parent?.name])).toEqual([
+        ["outer", "invocation"],
+        ["parent", "outer"],
+        ["child", "parent"],
+      ]);
+      expect(delegate.spans.map((span) => span.name)).toEqual(["outer", "parent", "child"]);
+      expect(currentSpan).toBe(delegate.spans[2]);
+      for (const [index, span] of recorder.spans.entries()) {
+        const delegateSpan = delegate.spans[index];
+        expect(span.attributes.get("scope.name")).toBe("effect");
+        expect(span.attributes.get("effect.trace.id")).toBe(delegateSpan?.traceId);
+        expect(span.attributes.get("effect.span.id")).toBe(delegateSpan?.spanId);
+        expect(span.attributes.get("effect.exit")).toBe("success");
+        expect(span.ended).toBe(true);
+      }
+      expect(recorder.spans[0]?.attributes.get("app.id")).toBe("id");
+      expect(delegate.spans[0]?.attributes.get("app.id")).toBe("id");
+      expect(recorder.activeSpan).toBe(recorder.invocation);
+    });
+
+    it("runs the delegate's context hook inside the restored Cloudflare context", async () => {
+      const delegate = makeDelegate();
+      const recorder = makeRecorder(() => true, true, true, {
+        tracerOptions: { delegate: delegate.tracer },
+      });
+      let observed: [string | undefined, Tracer.AnySpan | undefined] | undefined;
+      const program = Effect.yieldNow.pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            observed = [recorder.activeSpan?.name, delegate.activeSpan];
+          }),
+        ),
+        Effect.withSpan("span"),
+        Effect.provideService(Tracer.Tracer, recorder.tracer),
+      );
+
+      await Effect.runPromise(program);
+
+      expect(delegate.spans.map((span) => span.name)).toEqual(["span"]);
+      expect(observed).toEqual(["span", delegate.spans[0]]);
+    });
+
+    it("keeps delegate sampling when a Cloudflare span is not traced", async () => {
+      const delegate = makeDelegate();
+      const recorder = makeRecorder((name) => name !== "parent", true, true, {
+        tracerOptions: { delegate: delegate.tracer },
+      });
+      const program = Effect.void.pipe(
+        Effect.withSpan("child"),
+        Effect.withSpan("parent"),
+        Effect.provideService(Tracer.Tracer, recorder.tracer),
+      );
+
+      await Effect.runPromise(program);
+
+      expect(recorder.spans.map((span) => span.name)).toEqual(["parent"]);
+      expect(delegate.spans.map((span) => [span.name, span.sampled])).toEqual([
+        ["parent", true],
+        ["child", true],
+      ]);
+    });
+
+    it("records failures and ends the Cloudflare span when the delegate fails to end", () => {
+      const endError = new Error("end failed");
+      const delegate = makeDelegate({ endError });
+      const recorder = makeRecorder(() => true, true, true, {
+        tracerOptions: { delegate: delegate.tracer },
+      });
+      const failure = new TestFailure({ message: "failed" });
+      const span = recorder.tracer.span(spanOptions("failure", Option.none(), true));
+
+      expect(() => span.end(1n, Exit.fail(failure))).toThrow(endError);
+      expect(() => span.end(2n, Exit.fail(failure))).not.toThrow();
+      expect(recorder.spans[0]?.attributes.get("effect.exit")).toBe("failure");
+      expect(recorder.spans[0]?.statuses).toEqual([{ code: "error" }]);
+      expect(recorder.spans[0]?.exceptions).toEqual([failure]);
+      expect(recorder.spans[0]?.ended).toBe(true);
+    });
+
+    it("starts no Cloudflare span when the delegate fails to create a span", () => {
+      const spanError = new Error("span failed");
+      const delegate = Tracer.make({
+        span: () => {
+          throw spanError;
+        },
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+
+      expect(() => recorder.tracer.span(spanOptions("failure", Option.none(), true))).toThrow(
+        spanError,
+      );
+      expect(recorder.spans).toEqual([]);
+    });
+
+    it("ends the Cloudflare span when mirroring the delegate span fails", () => {
+      const mirrorError = new Error("mirror failed");
+      const delegate = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          Object.defineProperty(span, "traceId", {
+            get: () => {
+              throw mirrorError;
+            },
+          });
+          return span;
+        },
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+
+      expect(() => recorder.tracer.span(spanOptions("failure", Option.none(), true))).toThrow(
+        mirrorError,
+      );
+      expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["failure", true]]);
+    });
+
+    it("starts no Cloudflare span for a delegate span that is already ended", async () => {
+      const delegate = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          span.end(options.startTime, Exit.void);
+          return span;
+        },
+      });
+      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const program = Effect.succeed("value").pipe(
+        Effect.withSpan("child"),
+        Effect.withSpan("ended"),
+        Effect.provideService(Tracer.Tracer, recorder.tracer),
+      );
+
+      await expect(Effect.runPromise(program)).resolves.toBe("value");
+
+      expect(recorder.spans).toEqual([]);
+      expect(recorder.activeSpan).toBe(recorder.invocation);
+    });
+
+    it.each([
+      { firstSampled: true, secondSampled: true },
+      { firstSampled: true, secondSampled: false },
+      { firstSampled: false, secondSampled: true },
+      { firstSampled: false, secondSampled: false },
+    ])("rejects a reused delegate span: %j", ({ firstSampled, secondSampled }) => {
+      const reused = new Tracer.NativeSpan(spanOptions("first", Option.none(), true));
+      const delegate = Tracer.make({ span: () => reused });
+      const first = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const second = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const firstSpan = first.tracer.span({
+        ...spanOptions("first", Option.none(), true),
+        sampled: firstSampled,
+      });
+
+      expect(() =>
+        second.tracer.span({
+          ...spanOptions("second", Option.none(), true),
+          sampled: secondSampled,
+        }),
+      ).toThrow("The delegate must return a new span for each call");
+      expect(second.spans).toEqual([]);
+
+      firstSpan.end(1n, Exit.void);
+      expect(first.spans.map((span) => span.ended)).toEqual(firstSampled ? [true] : []);
+    });
+
+    it("rejects an already-ended delegate span reused without Cloudflare tracing", () => {
+      const reused = new Tracer.NativeSpan(spanOptions("first", Option.none(), true));
+      reused.end(1n, Exit.void);
+      const delegate = Tracer.make({ span: () => reused });
+      const first = makeTracer(undefined, undefined, { delegate });
+      const second = makeTracer(undefined, undefined, { delegate });
+
+      expect(first.span(spanOptions("first", Option.none(), true))).toBe(reused);
+      expect(() => second.span(spanOptions("second", Option.none(), true))).toThrow(
+        "The delegate must return a new span for each call",
+      );
+    });
+
+    it("does not run a request with another request's async context", async () => {
+      const requestContext = new AsyncLocalStorage<string>();
+      const reused = new Tracer.NativeSpan(spanOptions("request", Option.none(), true));
+      reused.end(1n, Exit.void);
+      const delegate = Tracer.make({ span: () => reused });
+      const runRequest = (id: string) =>
+        requestContext.run(id, () => {
+          const tracer = makeTracer(undefined, undefined, { delegate });
+          const program = Effect.sync(() => requestContext.getStore()).pipe(
+            Effect.withSpan("request"),
+            Effect.provideService(Tracer.Tracer, tracer),
+          );
+          return Effect.runPromise(program);
+        });
+
+      await expect(runRequest("request-A")).resolves.toBe("request-A");
+      await expect(runRequest("request-B")).rejects.toThrow(
+        "The delegate must return a new span for each call",
+      );
+    });
   });
 });
