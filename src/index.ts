@@ -250,13 +250,13 @@ export const makeTracer = (
         : stateFor(Option.getOrUndefined(spanOptions.parent));
       const parentContext = parentState?.runInAsyncContext ?? invocationContext;
       const withoutCloudflareSpan = (span: Tracer.Span): Tracer.Span => {
-        // A reused delegate span keeps the state from its first use.
-        if (!spanStates.has(span)) {
-          spanStates.set(span, {
-            isTraced: parentState?.isTraced ?? true,
-            runInAsyncContext: parentContext,
-          });
+        if (spanStates.has(span)) {
+          throw new Error("The delegate must return a new span for each call");
         }
+        spanStates.set(span, {
+          isTraced: parentState?.isTraced ?? true,
+          runInAsyncContext: parentContext,
+        });
         return span;
       };
 
@@ -276,8 +276,7 @@ export const makeTracer = (
 
       const start = () => {
         const delegateSpan = delegate?.span(spanOptions);
-        // Mirror only a new, open delegate span. A reused span already has a Cloudflare span, and Effect
-        // may never end a span that is already ended.
+        // Effect may never end an already-ended span. A reused span must not restore its first context.
         if (
           delegateSpan !== undefined &&
           (spanStates.has(delegateSpan) || delegateSpan.status._tag === "Ended")

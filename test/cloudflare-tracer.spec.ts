@@ -1,4 +1,5 @@
 import { Context, Data, Effect, Exit, Fiber, Option, Tracer } from "effect";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { describe, expect, it } from "vitest";
 import {
   type CaptureAsyncContext,
@@ -751,22 +752,65 @@ describe("Cloudflare Effect tracer", () => {
       expect(recorder.activeSpan).toBe(recorder.invocation);
     });
 
-    it("mirrors a reused delegate span only once", async () => {
-      let reused: Tracer.NativeSpan | undefined;
-      const delegate = Tracer.make({
-        span: (options) => (reused ??= new Tracer.NativeSpan(options)),
+    it.each([
+      { firstSampled: true, secondSampled: true },
+      { firstSampled: true, secondSampled: false },
+      { firstSampled: false, secondSampled: true },
+      { firstSampled: false, secondSampled: false },
+    ])("rejects a reused delegate span: %j", ({ firstSampled, secondSampled }) => {
+      const reused = new Tracer.NativeSpan(spanOptions("first", Option.none(), true));
+      const delegate = Tracer.make({ span: () => reused });
+      const first = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const second = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
+      const firstSpan = first.tracer.span({
+        ...spanOptions("first", Option.none(), true),
+        sampled: firstSampled,
       });
-      const recorder = makeRecorder(() => true, true, true, { tracerOptions: { delegate } });
-      const program = Effect.annotateCurrentSpan("app.id", "id").pipe(
-        Effect.withSpan("inner"),
-        Effect.withSpan("outer"),
-        Effect.provideService(Tracer.Tracer, recorder.tracer),
+
+      expect(() =>
+        second.tracer.span({
+          ...spanOptions("second", Option.none(), true),
+          sampled: secondSampled,
+        }),
+      ).toThrow("The delegate must return a new span for each call");
+      expect(second.spans).toEqual([]);
+
+      firstSpan.end(1n, Exit.void);
+      expect(first.spans.map((span) => span.ended)).toEqual(firstSampled ? [true] : []);
+    });
+
+    it("rejects an already-ended delegate span reused without Cloudflare tracing", () => {
+      const reused = new Tracer.NativeSpan(spanOptions("first", Option.none(), true));
+      reused.end(1n, Exit.void);
+      const delegate = Tracer.make({ span: () => reused });
+      const first = makeTracer(undefined, undefined, { delegate });
+      const second = makeTracer(undefined, undefined, { delegate });
+
+      expect(first.span(spanOptions("first", Option.none(), true))).toBe(reused);
+      expect(() => second.span(spanOptions("second", Option.none(), true))).toThrow(
+        "The delegate must return a new span for each call",
       );
+    });
 
-      await Effect.runPromise(program);
+    it("does not run a request with another request's async context", async () => {
+      const requestContext = new AsyncLocalStorage<string>();
+      const reused = new Tracer.NativeSpan(spanOptions("request", Option.none(), true));
+      reused.end(1n, Exit.void);
+      const delegate = Tracer.make({ span: () => reused });
+      const runRequest = (id: string) =>
+        requestContext.run(id, () => {
+          const tracer = makeTracer(undefined, undefined, { delegate });
+          const program = Effect.sync(() => requestContext.getStore()).pipe(
+            Effect.withSpan("request"),
+            Effect.provideService(Tracer.Tracer, tracer),
+          );
+          return Effect.runPromise(program);
+        });
 
-      expect(recorder.spans.map((span) => [span.name, span.ended])).toEqual([["outer", true]]);
-      expect(recorder.spans[0]?.attributes.get("app.id")).toBe("id");
+      await expect(runRequest("request-A")).resolves.toBe("request-A");
+      await expect(runRequest("request-B")).rejects.toThrow(
+        "The delegate must return a new span for each call",
+      );
     });
   });
 });
